@@ -202,7 +202,7 @@ from merklemaker import MakeBlockHeader
 from struct import pack, unpack
 import threading
 from time import time
-from util import PendingUpstream, RejectedShare, bdiff1target, dblsha, LEhash2int, swap32, target2bdiff, target2pdiff
+from util import PendingUpstream, RejectedShare, bdiff1target, dblsha, PoWHash, LEhash2int, swap32, target2bdiff, target2pdiff
 import jsonrpc
 import traceback
 
@@ -542,9 +542,9 @@ def checkShare(share):
 		raise RejectedShare('duplicate')
 	DupeShareHACK[data] = None
 	
-	blkhash = dblsha(data)
-	if blkhash[28:] != b'\0\0\0\0':
-		raise RejectedShare('H-not-zero')
+	blkhash = PoWHash(data)
+	#if blkhash[28:] != b'\0\0\0\0':
+	#	raise RejectedShare('H-not-zero')
 	blkhashn = LEhash2int(blkhash)
 	
 	global networkTarget
