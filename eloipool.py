@@ -19,6 +19,7 @@
 import argparse
 import importlib
 import struct
+import util
 argparser = argparse.ArgumentParser()
 argparser.add_argument('-c', '--config', help='Config name to load from config_<ARG>.py')
 args = argparser.parse_args()
@@ -28,15 +29,16 @@ if not args.config is None:
 __import__(configmod)
 config = importlib.import_module(configmod)
 
-if not hasattr(config, 'BlockVersion'):
-	config.BlockVersion = 4
-config.BlockVersionBytes = struct.pack('<L', config.BlockVersion)
-
 if not hasattr(config, 'ServerName'):
 	config.ServerName = 'Unnamed Eloipool'
 
 if not hasattr(config, 'ShareTarget'):
 	config.ShareTarget = 0x00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+if not hasattr(config, 'WorkUpdateInterval'):
+	config.WorkUpdateInterval = 55
+config.StaleWorkTimeout = max(120, config.WorkUpdateInterval * 2)
+util.UniqueSessionIdManager._defaultDelay = config.StaleWorkTimeout
 
 
 import logging
@@ -51,6 +53,7 @@ if len(rootlogger.handlers) == 0:
 		level=logging.DEBUG,
 	)
 	for infoOnly in (
+		'BitcoinRPC',
 		'checkShare',
 		'getTarget',
 		'JSONRPCHandler',
@@ -92,7 +95,7 @@ except:
 	pass
 
 
-from bitcoin.script import BitcoinScript
+from bitcoin.script import BitcoinScript, WitnessMagic
 from bitcoin.txn import Txn
 from base58 import b58decode
 from binascii import b2a_hex
@@ -100,7 +103,10 @@ from struct import pack
 import subprocess
 from time import time
 
-def makeCoinbaseTxn(coinbaseValue, useCoinbaser = True, prevBlockHex = None):
+def makeCoinbaseTxn(coinbaseValue, useCoinbaser = True, prevBlockHex = None, witness_commitment = NotImplemented):
+	if witness_commitment is NotImplemented:
+		raise NotImplementedError
+	
 	txn = Txn.new()
 	
 	if useCoinbaser and hasattr(config, 'CoinbaserCmd') and config.CoinbaserCmd:
@@ -127,6 +133,10 @@ def makeCoinbaseTxn(coinbaseValue, useCoinbaser = True, prevBlockHex = None):
 	
 	pkScript = BitcoinScript.toAddress(config.TrackerAddr)
 	txn.addOutput(coinbaseValue, pkScript)
+	
+	# SegWit commitment
+	if not witness_commitment is None:
+		txn.addOutput(0, BitcoinScript.commitment(WitnessMagic + witness_commitment))
 	
 	# TODO
 	# TODO: red flag on dupe coinbase
@@ -172,7 +182,7 @@ def _WorkLogPruner_I(wl):
 	for username in wl:
 		userwork = wl[username]
 		for wli in tuple(userwork.keys()):
-			if now > userwork[wli][1] + 120:
+			if now > userwork[wli][1] + config.StaleWorkTimeout:
 				del userwork[wli]
 				pruned += 1
 	WorkLogPruner.logger.debug('Pruned %d jobs' % (pruned,))
@@ -316,7 +326,7 @@ def RegisterWork(username, wli, wld, RequestedTarget = None):
 def getBlockHeader(username):
 	MRD = MM.getMRD()
 	merkleRoot = MRD[0]
-	hdr = MakeBlockHeader(MRD, config.BlockVersionBytes)
+	hdr = MakeBlockHeader(MRD)
 	workLog.setdefault(username, {})[merkleRoot] = (MRD, time())
 	target = RegisterWork(username, merkleRoot, MRD)
 	return (hdr, workLog[username][merkleRoot], target)
@@ -438,7 +448,7 @@ def blockSubmissionThread(payload, blkhash, share):
 			logShare(share)
 blockSubmissionThread.logger = logging.getLogger('blockSubmission')
 
-def checkData(share):
+def checkData(share, wld):
 	data = share['data']
 	data = data[:80]
 	(prevBlock, height, bits) = MM.currentBlock
@@ -451,13 +461,14 @@ def checkData(share):
 	if data[72:76] != bits:
 		raise RejectedShare('bad-diffbits')
 	
-	if data[0] != config.BlockVersionBytes:
+	MT = wld[1]
+	if data[0:4] != MT.MP['_BlockVersionBytes']:
 		raise RejectedShare('bad-version')
 
-def buildStratumData(share, merkleroot):
+def buildStratumData(share, merkleroot, versionbytes):
 	(prevBlock, height, bits) = MM.currentBlock
 	
-	data = config.BlockVersionBytes
+	data = versionbytes
 	data += prevBlock
 	data += merkleroot
 	data += share['ntime'][::-1]
@@ -473,9 +484,17 @@ def IsJobValid(wli, wluser = None):
 	if wli not in workLog[wluser]:
 		return False
 	(wld, issueT) = workLog[wluser][wli]
-	if time() < issueT - 120:
+	if time() < issueT - config.StaleWorkTimeout:
 		return False
 	return True
+
+def LookupWork(username, wli):
+	if username not in workLog:
+		raise RejectedShare('unknown-user')
+	MWL = workLog[username]
+	if wli not in MWL:
+		raise RejectedShare('unknown-work')
+	return MWL[wli]
 
 def checkShare(share):
 	shareTime = share['time'] = time()
@@ -484,12 +503,7 @@ def checkShare(share):
 	checkQuickDiffAdjustment = False
 	if 'data' in share:
 		# getwork/GBT
-		checkData(share)
 		data = share['data']
-		
-		if username not in workLog:
-			raise RejectedShare('unknown-user')
-		MWL = workLog[username]
 		
 		shareMerkleRoot = data[36:68]
 		if 'blkdata' in share:
@@ -508,22 +522,18 @@ def checkShare(share):
 			mode = 'MRD'
 			moden = 0
 			coinbase = None
+		
+		(wld, issueT) = LookupWork(username, wli)
+		checkData(share, wld)
 	else:
 		# Stratum
 		checkQuickDiffAdjustment = config.DynamicTargetQuick
 		wli = share['jobid']
-		buildStratumData(share, b'\0' * 32)
+		(wld, issueT) = LookupWork(None, wli)
 		mode = 'MC'
 		moden = 1
 		othertxndata = b''
-		if None not in workLog:
-			# We haven't yet sent any stratum work for this block
-			raise RejectedShare('unknown-work')
-		MWL = workLog[None]
 	
-	if wli not in MWL:
-		raise RejectedShare('unknown-work')
-	(wld, issueT) = MWL[wli]
 	share[mode] = wld
 	
 	share['issuetime'] = issueT
@@ -535,7 +545,7 @@ def checkShare(share):
 		coinbase = workCoinbase + share['extranonce1'] + share['extranonce2']
 		cbtxn.setCoinbase(coinbase)
 		cbtxn.assemble()
-		data = buildStratumData(share, workMerkleTree.withFirst(cbtxn))
+		data = buildStratumData(share, workMerkleTree.withFirst(cbtxn), workMerkleTree.MP['_BlockVersionBytes'])
 		shareMerkleRoot = data[36:68]
 	
 	if data in DupeShareHACK:
@@ -616,7 +626,7 @@ def checkShare(share):
 	share['_targethex'] = '%064x' % (workTarget,)
 	
 	shareTimestamp = unpack('<L', data[68:72])[0]
-	if shareTime < issueT - 120:
+	if shareTime < issueT - config.StaleWorkTimeout:
 		raise RejectedShare('stale-work')
 	if shareTimestamp < shareTime - 300:
 		raise RejectedShare('time-too-old')
@@ -686,6 +696,9 @@ def receiveShare(share):
 		share['rejectReason'] = 'ERROR'
 		raise
 	finally:
+		if 'data' not in share:
+			# In case of rejection, data might not have been defined yet, but logging may need it
+			buildStratumData(share, b'\0' * 32, b'\xff\xff\xff\xff')
 		if not share.get('upstreamRejectReason', None) is PendingUpstream:
 			logShare(share)
 
@@ -830,7 +843,7 @@ def restoreState(SAVE_STATE_FILENAME):
 					# Current format, from 2012-02-03 onward
 					DupeShareHACK = pickle.load(f)
 				
-				if t + 120 >= time():
+				if t + config.StaleWorkTimeout >= time():
 					workLog = pickle.load(f)
 				else:
 					logger.debug('Skipping restore of expired workLog')
@@ -939,8 +952,8 @@ if __name__ == "__main__":
 	server.getBlockTemplate = getBlockTemplate
 	server.receiveShare = receiveShare
 	server.RaiseRedFlags = RaiseRedFlags
-	server.BlockVersion = config.BlockVersion
 	server.ShareTarget = config.ShareTarget
+	server.StaleWorkTimeout = config.StaleWorkTimeout
 	server.checkAuthentication = checkAuthentication
 	
 	if hasattr(config, 'TrustedForwarders'):
@@ -953,10 +966,10 @@ if __name__ == "__main__":
 	stratumsrv.receiveShare = receiveShare
 	stratumsrv.RaiseRedFlags = RaiseRedFlags
 	stratumsrv.getTarget = getTarget
-	stratumsrv.BlockVersionHex = '%08x' % (config.BlockVersion,)
 	stratumsrv.defaultTarget = config.ShareTarget
 	stratumsrv.IsJobValid = IsJobValid
 	stratumsrv.checkAuthentication = checkAuthentication
+	stratumsrv.WorkUpdateInterval = config.WorkUpdateInterval
 	if not hasattr(config, 'StratumAddresses'):
 		config.StratumAddresses = ()
 	for a in config.StratumAddresses:
